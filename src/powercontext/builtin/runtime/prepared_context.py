@@ -17,9 +17,12 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Sequence
+import re
+from collections import Counter
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 from itertools import chain
+from math import log
 from typing import TypeVar
 
 from powercontext.artifacts import ArtifactAddress, ArtifactRef
@@ -47,6 +50,15 @@ _ELLIPSIS = "…"
 _BEGIN_MARKER = "BEGIN_POWERCONTEXT_PREPARED_CONTEXT_V1"
 _END_MARKER = "END_POWERCONTEXT_PREPARED_CONTEXT_V1"
 _Item = TypeVar("_Item")
+
+# Evidence selection: lexical scoring of literal entry spans.
+_TOKEN_RE = re.compile(r"[a-z]+|\d+|[\u4e00-\u9fff]+")
+_SENTENCE_END_RE = re.compile(r"[.!?。！？]+(?=\s|$)")
+_PHRASE_BONUS = 0.6
+_OCCURRENCE_BONUS = 0.3
+_MAX_EXTRA_OCCURRENCES = 2
+_STEM_WEIGHT = 0.5
+_STEM_PREFIX_LENGTH = 5
 
 
 @dataclass(frozen=True)
@@ -106,6 +118,7 @@ class PreparedContextBuild:
     origins: tuple[PreparedContextOrigin, ...]
     omissions: PreparedContextOmissions = PreparedContextOmissions()
     code_origins: tuple[CodeEvidenceRef, ...] = ()
+    fragments: tuple[PreparedFragment, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -118,6 +131,48 @@ class MemoryEntryAddress:
 
 
 PreparedContextOrigin = MemoryCitation | ArtifactRef | MemoryEntryAddress | ArtifactAddress
+
+
+@dataclass(frozen=True)
+class PreparedFragment:
+    """One literal character span selected from a Memory entry body.
+
+    ``text`` is always ``address``'s entry text sliced by ``[start:end]``; it is never
+    rewritten, translated, or otherwise generated.
+    """
+
+    address: MemoryEntryAddress
+    start: int
+    end: int
+    text: str
+
+
+@dataclass(frozen=True)
+class _EvidenceEntry:
+    """A candidate Memory entry reduced to what evidence selection needs."""
+
+    address: MemoryEntryAddress
+    text: str
+
+
+@dataclass(frozen=True)
+class _EvidenceSpan:
+    """A literal, merged span within one Memory entry."""
+
+    start: int
+    end: int
+    text: str
+
+
+@dataclass(frozen=True)
+class _SentenceCandidate:
+    """A scored sentence span plus its position for deterministic ordering."""
+
+    entry_index: int
+    sentence_index: int
+    start: int
+    end: int
+    score: float
 
 
 @dataclass(frozen=True)
@@ -211,6 +266,12 @@ class PreparedContextBuilder:
         profile_candidates: Sequence[PreparedProfileCandidate] = (),
         code_candidates: Sequence[PreparedCodeCandidate] = (),
     ) -> PreparedContextBuild:
+        if request.evidence_selection:
+            return self._build_evidence_selection(
+                request=request,
+                current_scope_id=current_scope_id,
+                memory_candidates=memory_candidates,
+            )
         if request.include_code:
 
             def historical(history_request: PrepareContextRequest, entries: int) -> PreparedContextBuild:
@@ -293,6 +354,86 @@ class PreparedContextBuilder:
             dropped_items=omissions.dropped_items,
             unused_bytes=max(0, request.max_bytes - content_bytes),
         )
+
+    def _build_evidence_selection(
+        self,
+        *,
+        request: PrepareContextRequest,
+        current_scope_id: str | None,
+        memory_candidates: Sequence[PreparedMemoryCandidates],
+    ) -> PreparedContextBuild:
+        """Select query-relevant literal spans from Memory entries under a byte budget."""
+
+        entries = self._evidence_entries(current_scope_id, memory_candidates)
+        ranked = _rank_sentences(entries, request.query)
+        selected = self._fit_evidence(ranked, entries, request.max_bytes)
+        if not selected:
+            return PreparedContextBuild(context=self.empty(), origins=(), omissions=PreparedContextOmissions())
+        fragments = tuple(
+            PreparedFragment(address=entry.address, start=span.start, end=span.end, text=span.text)
+            for entry, span in selected
+        )
+        origins = tuple(entry.address for entry, _ in selected)
+        content = _render_evidence(selected)
+        return PreparedContextBuild(
+            context=PreparedContext(
+                status="ready", content=content, content_bytes=len(content.encode("utf-8"))
+            ),
+            origins=origins,
+            omissions=PreparedContextOmissions(),
+            fragments=fragments,
+        )
+
+    def _evidence_entries(
+        self,
+        current_scope_id: str | None,
+        memory_candidates: Sequence[PreparedMemoryCandidates],
+    ) -> tuple[_EvidenceEntry, ...]:
+        """Flatten candidate groups into uniquely addressed, literal Memory entries."""
+
+        entries: list[_EvidenceEntry] = []
+        seen: set[tuple[str, str, str]] = set()
+        for group in memory_candidates:
+            scope_id = group.scope_id or current_scope_id or ""
+            for hit in group.hits:
+                if not hit.text.strip():
+                    continue
+                identity = (scope_id, hit.entry_id, hit.entry_version_id)
+                if identity in seen:
+                    continue
+                seen.add(identity)
+                memory = ArtifactAddress(scope_id=scope_id, artifact=hit.memory_ref)
+                address = MemoryEntryAddress(
+                    memory=memory,
+                    entry_id=hit.entry_id,
+                    entry_version_id=hit.entry_version_id,
+                )
+                entries.append(_EvidenceEntry(address=address, text=hit.text))
+        return tuple(entries)
+
+    def _fit_evidence(
+        self,
+        ranked: Sequence[_SentenceCandidate],
+        entries: Sequence[_EvidenceEntry],
+        max_bytes: int,
+    ) -> tuple[tuple[_EvidenceEntry, _EvidenceSpan], ...]:
+        """Greedily admit the highest-scoring sentences that keep the render in budget."""
+
+        positive = [candidate for candidate in ranked if candidate.score > 0]
+        pool = positive if positive else list(ranked[:1])
+        chosen: dict[int, list[_SentenceCandidate]] = {}
+        best: tuple[tuple[_EvidenceEntry, _EvidenceSpan], ...] = ()
+        for candidate in pool:
+            chosen.setdefault(candidate.entry_index, []).append(candidate)
+            merged = _assemble_evidence(chosen, entries)
+            if len(_render_evidence(merged).encode("utf-8")) <= max_bytes:
+                best = merged
+                continue
+            group = chosen[candidate.entry_index]
+            group.remove(candidate)
+            if not group:
+                del chosen[candidate.entry_index]
+        return best
 
     def _select_entries(
         self,
@@ -658,6 +799,142 @@ class PreparedContextBuilder:
         if best is None:
             return _EntryFit(dropped_no_fitting_truncation=True)
         return _EntryFit(entry=best)
+
+
+def _tokens(text: str) -> tuple[str, ...]:
+    """Lowercase word/number tokens including contiguous CJK runs."""
+
+    return tuple(_TOKEN_RE.findall(text.lower()))
+
+
+def _stem(token: str) -> str:
+    """A light singular/plural stem for Latin words; other tokens stay exact."""
+
+    if not token.isascii() or not token.isalpha() or len(token) < _STEM_PREFIX_LENGTH:
+        return token
+    return token.rstrip("s")[:_STEM_PREFIX_LENGTH]
+
+
+def _trim_span(text: str, start: int, end: int) -> tuple[int, int] | None:
+    """Trim surrounding whitespace while keeping exact original coordinates."""
+
+    while start < end and text[start].isspace():
+        start += 1
+    while end > start and text[end - 1].isspace():
+        end -= 1
+    return (start, end) if start < end else None
+
+
+def _sentence_spans(text: str) -> tuple[tuple[int, int], ...]:
+    """Find sentence-like literal spans, keeping punctuation and exact offsets."""
+
+    spans: list[tuple[int, int]] = []
+    start = 0
+    for match in _SENTENCE_END_RE.finditer(text):
+        trimmed = _trim_span(text, start, match.end())
+        if trimmed is not None:
+            spans.append(trimmed)
+        start = match.end()
+    trimmed = _trim_span(text, start, len(text))
+    if trimmed is not None:
+        spans.append(trimmed)
+    return tuple(spans)
+
+
+def _rank_sentences(entries: Sequence[_EvidenceEntry], query: str) -> list[_SentenceCandidate]:
+    """Rank every entry sentence by IDF-weighted lexical overlap with the query."""
+
+    query_tokens = _tokens(query)
+    query_set = set(query_tokens)
+    query_bigrams = set(zip(query_tokens, query_tokens[1:]))
+    spans: list[tuple[int, int, int, int, tuple[str, ...]]] = []
+    for entry_index, entry in enumerate(entries):
+        for sentence_index, (start, end) in enumerate(_sentence_spans(entry.text)):
+            tokens = _tokens(entry.text[start:end])
+            spans.append((entry_index, sentence_index, start, end, tokens))
+
+    total = max(len(spans), 1)
+    document_frequency: dict[str, int] = {}
+    for _, _, _, _, tokens in spans:
+        for token in set(tokens):
+            document_frequency[token] = document_frequency.get(token, 0) + 1
+
+    def idf(token: str) -> float:
+        return log(1.0 + total / (1 + document_frequency.get(token, 0)))
+
+    ranked: list[_SentenceCandidate] = []
+    for entry_index, sentence_index, start, end, tokens in spans:
+        counts = Counter(tokens)
+        sentence_stems = {stem for token in tokens if (stem := _stem(token)) != token}
+        score = 0.0
+        for token in query_set:
+            occurrences = counts.get(token, 0)
+            if occurrences:
+                extra = min(occurrences - 1, _MAX_EXTRA_OCCURRENCES)
+                score += idf(token) * (1.0 + extra * _OCCURRENCE_BONUS)
+            elif _stem(token) in sentence_stems:
+                score += _STEM_WEIGHT * idf(token)
+        sentence_bigrams = set(zip(tokens, tokens[1:]))
+        score += _PHRASE_BONUS * len(query_bigrams & sentence_bigrams)
+        ranked.append(_SentenceCandidate(entry_index, sentence_index, start, end, score))
+    ranked.sort(key=lambda candidate: (-candidate.score, candidate.entry_index, candidate.sentence_index))
+    return ranked
+
+
+def _merge_spans(text: str, sentences: Sequence[_SentenceCandidate]) -> tuple[_EvidenceSpan, ...]:
+    """Merge selected sentences separated only by whitespace into one literal span."""
+
+    ordered = sorted(sentences, key=lambda candidate: (candidate.start, candidate.end))
+    merged: list[_EvidenceSpan] = []
+    start, end = ordered[0].start, ordered[0].end
+    for candidate in ordered[1:]:
+        if not text[end : candidate.start].strip():
+            end = candidate.end
+            continue
+        merged.append(_EvidenceSpan(start, end, text[start:end]))
+        start, end = candidate.start, candidate.end
+    merged.append(_EvidenceSpan(start, end, text[start:end]))
+    return tuple(merged)
+
+
+def _assemble_evidence(
+    chosen: Mapping[int, Sequence[_SentenceCandidate]],
+    entries: Sequence[_EvidenceEntry],
+) -> tuple[tuple[_EvidenceEntry, _EvidenceSpan], ...]:
+    """Turn per-entry selected sentences into ordered, addressable literal spans."""
+
+    assembled: list[tuple[_EvidenceEntry, _EvidenceSpan]] = []
+    for entry_index in sorted(chosen):
+        entry = entries[entry_index]
+        for span in _merge_spans(entry.text, chosen[entry_index]):
+            assembled.append((entry, span))
+    return tuple(assembled)
+
+
+def _render_evidence(selected: Sequence[tuple[_EvidenceEntry, _EvidenceSpan]]) -> str:
+    """Render literal spans with exact citations inside the standard envelope."""
+
+    items: list[dict[str, object]] = []
+    for entry, span in selected:
+        address = entry.address
+        citation: dict[str, object] = {
+            "scope_id": address.memory.scope_id,
+            "memory_ref": address.memory.artifact.model_dump(mode="json"),
+            "entry_id": address.entry_id,
+            "entry_version_id": address.entry_version_id,
+        }
+        items.append(
+            {
+                "citation": citation,
+                "content": span.text,
+                "start": span.start,
+                "end": span.end,
+                "truncated": False,
+            }
+        )
+    envelope = {"trust": "untrusted_history", "items": items}
+    encoded = json.dumps(envelope, ensure_ascii=False, separators=(",", ":"))
+    return "\n\n".join((TRUST_POLICY, f"{_BEGIN_MARKER}\n{encoded}\n{_END_MARKER}"))
 
 
 def _interleave(

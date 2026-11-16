@@ -97,6 +97,7 @@ from powercontext.builtin.persistence.processing_migration import (
     bootstrap_processing_schema,
 )
 from powercontext.builtin.persistence.scope_search_schema import ensure_scope_search_schema
+from powercontext.builtin.persistence.seekdb.memory_index import SeekDBHybridMemoryIndex
 from powercontext.builtin.persistence.seekdb.profile import SeekDBConfig, SeekDBProfile
 from powercontext.builtin.persistence.skill_distribution_schema import ensure_skill_distribution_schema
 from powercontext.builtin.persistence.sqlite.experience_index import SQLiteExperienceFTSIndex
@@ -787,6 +788,10 @@ def _artifact_processing_bindings(  # noqa: C901 - validate and assemble one reg
                 if family == "skill"
                 else SourceProcessingPendingProvider(contexts.database, binding, family),
                 automatic_scope_filter=enabled_profile_scopes if family == "profile" else None,
+                source_count_threshold={
+                    "memory": config.runtime.memory_source_count_threshold,
+                    "topic-memory": config.runtime.topic_memory_source_count_threshold,
+                }.get(family),
             )
         )
     _validate_processing_registrations(configured)
@@ -960,10 +965,15 @@ async def open_builtin_contexts(
                 await contexts.aclose_usage_recorder()
         return
     experience_index = OceanBaseExperienceFTSIndex()
-    indexes = [OceanBaseMemoryFTSIndex()]
-    if embedding_model is not None:
-        indexes.append(OceanBaseMemoryVectorIndex(embedding_model.profile))
-    index = CompositeMemoryIndex(*indexes)
+    if isinstance(database, SeekDBConfig) and embedding_model is not None:
+        # seekdb answers hybrid candidate retrieval with one native UNION of
+        # its FULLTEXT and HNSW scans; single-channel strategies stay unchanged.
+        index = SeekDBHybridMemoryIndex(embedding_model.profile)
+    else:
+        indexes = [OceanBaseMemoryFTSIndex()]
+        if embedding_model is not None:
+            indexes.append(OceanBaseMemoryVectorIndex(embedding_model.profile))
+        index = CompositeMemoryIndex(*indexes)
     topic_indexes: list[TopicMemoryIndex] = [OceanBaseTopicMemoryFTSIndex()]
     if embedding_model is not None:
         topic_indexes.append(OceanBaseTopicMemoryVectorIndex(embedding_model.profile))

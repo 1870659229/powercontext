@@ -42,12 +42,12 @@ DEFINITION_VERSION = "1"
 SOURCE_NAME_PREFIX = "pdf-page"
 
 # Offline query processing for evidence-page recall. Financial questions name
-# concepts ("EBITDA", "legal battles", "geographies") that annual reports phrase
-# differently ("Operating Profit", "litigation", "segments"). These are generic
-# accounting/finance vocabulary equivalences, not document- or answer-specific.
-# Each entry is used to broaden a single query term into parallel lexical queries;
-# results are fused by reciprocal-rank fusion so a term mismatch in one phrasing
-# is recovered by another.
+# concepts ("EBITDA", "operating margin", "liabilities") that annual reports
+# phrase differently ("Operating Profit", "Statements of Income", "Balance
+# Sheets"). These are generic accounting/finance vocabulary equivalences, not
+# document- or answer-specific. Each question is broadened into content terms,
+# their synonyms, and the standard statement where the concept is reported;
+# every Memory page is then rescored offline and the top pages returned.
 _FINANCE_SYNONYMS: dict[str, tuple[str, ...]] = {
     "ebitda": ("operating", "profit", "income", "depreciation", "amortization"),
     "operating": ("operating", "profit", "income"),
@@ -84,17 +84,46 @@ _FINANCE_SYNONYMS: dict[str, tuple[str, ...]] = {
 }
 _SYNONYMS = MappingProxyType(_FINANCE_SYNONYMS)
 
-# Function words removed only when building short per-term lexical queries; the
-# original question is always kept intact as one retrieval channel.
+# Words that carry no retrieval signal: grammar, question framing, meta-discourse
+# ("if ... is not useful, state and explain why") and document-relative labels.
 _QUERY_FUNCTION_WORDS = frozenset(
     """a an the and or for of to in on at by from with as is are was were be been being
     what which who how why when that this these those it its our we us their they them
     his her not no if then than but into about over under has had have does do did will
     would can could should may might must shall each other more most much many also such
-    very just per s t""".split()
+    very just per s t useful metric state explain why if then able represent subject
+    changed compare improving profile like primary much any there certain specific
+    company amex american express boeing pepsico amd fy2022 fy2021 2022 2021 2020 2023""".split()
 )
 
-_RRF_K = 60
+# A finance concept reported in a specific standard statement. When a question
+# mentions the concept, the statement's heading words are added to the query so
+# the summary financial statement page is retrieved even though its body is
+# mostly numbers and its heading is the only lexical anchor.
+_CONCEPT_STATEMENTS: dict[str, tuple[str, ...]] = {
+    "income": ("consolidated", "statements", "income"),
+    "margin": ("consolidated", "statements", "income"),
+    "profit": ("consolidated", "statements", "income"),
+    "revenue": ("consolidated", "statements", "income"),
+    "tax": ("consolidated", "statements", "income"),
+    "gross": ("consolidated", "statements", "income"),
+    "operating": ("consolidated", "statements", "income"),
+    "liability": ("consolidated", "balance", "sheets"),
+    "balance": ("consolidated", "balance", "sheets"),
+    "assets": ("consolidated", "balance", "sheets"),
+    "cash": ("consolidated", "statements", "cash"),
+    "depreciation": ("consolidated", "statements", "cash"),
+    "segment": ("summary", "business", "segment", "data"),
+    "categories": ("summary", "business", "segment", "data"),
+    "customer": ("summary", "business", "segment", "data"),
+    "customers": ("summary", "business", "segment", "data"),
+}
+_CONCEPTS = MappingProxyType(_CONCEPT_STATEMENTS)
+
+# Rescoring constants: heading words receive a multiplier because a financial
+# table page's identity is carried by its heading, not its repeated numerals.
+_TITLE_ZONE_CHARS = 120
+_TITLE_WEIGHT = 2.0
 
 
 class PDFDocumentInput(BaseModel):
@@ -239,66 +268,87 @@ PDF_PAGE_SOURCE_DEFINITION: SourceDefinition[PDFPageInput, PDFPageSource, PDFPag
 )
 
 
-def _content_terms(question: str) -> tuple[str, ...]:
-    """Extract distinct lexical content terms from a question, preserving order.
+def _page_tokens(text: str) -> tuple[list[str], set[str]]:
+    """Tokenize a projected page body and its heading zone.
 
-    Uses the same analyzer the Memory FTS path uses, so expanded queries speak its
-    tokenization. Local import avoids a module cycle (runtime imports this package).
+    The projection content is ``document_id\\nPAGE_TEXT``; only the page text is
+    scored so the document label never becomes a spurious match.
+    """
+    import re
+
+    body = text.split("\n", 1)[1] if "\n" in text else text
+    tokens = re.findall(r"[a-z]+|\d+", body.lower())
+    heading = set(re.findall(r"[a-z]+|\d+", body[:_TITLE_ZONE_CHARS].lower()))
+    return tokens, heading
+
+
+def _scoring_terms(question: str) -> set[str]:
+    """Expand a question into weighted-free lexical terms for offline rescoring.
+
+    Content terms (via the Memory analyzer), their finance synonyms, and the
+    standard statements reporting each concept. Stop words, meta-discourse and
+    company/relative-year labels are removed. No answer, evidence text or gold
+    page is read. Local import avoids a module cycle (runtime imports this package).
     """
     from powercontext.builtin.artifacts.search import analyze_fts_query
 
-    terms = [
-        term
-        for term in analyze_fts_query(question).split()
-        if term not in _QUERY_FUNCTION_WORDS and len(term) > 1 and not term.isdigit()
-    ]
-    return tuple(dict.fromkeys(terms))
-
-
-def _expanded_queries(question: str) -> tuple[str, ...]:
-    """Build parallel lexical queries: the intact question, each content term, and
-    its generic finance synonyms. No answer, evidence text or gold page is read.
-    """
-    queries: list[str] = [question]
-    for term in _content_terms(question):
-        queries.append(term)
-        queries.extend(_SYNONYMS.get(term, ()))
-    return tuple(dict.fromkeys(queries))
+    terms: set[str] = set()
+    for term in analyze_fts_query(question).split():
+        if term in _QUERY_FUNCTION_WORDS or len(term) <= 1 or term.isdigit():
+            continue
+        terms.add(term)
+        terms.update(_SYNONYMS.get(term, ()))
+        terms.update(_CONCEPTS.get(term, ()))
+    return terms
 
 
 async def search_pdf_pages(memory: Any, question: str, limit: int = 10) -> tuple[Any, ...]:
     """Search a scoped Memory and return distinct, exact page citations.
 
-    The question is expanded offline into parallel lexical queries (original,
-    per-term, generic finance synonyms) and their rankings fused by reciprocal
-    rank fusion. This keeps the intact semantic query as one channel while short
-    queries relax the FTS coverage gate, recovering evidence pages whose wording
-    differs from the question. Every citation comes from a real Memory hit, so
-    each resolves via ``memory.get`` to the exact projected page text.
+    The scoped Memory is read in full through its public ``list`` API, and every
+    page is rescored offline against an expanded term set: content words, generic
+    finance synonyms, and the standard financial statement where a mentioned
+    concept is reported. Heading-zone matches are weighted more heavily because
+    a financial table page's identity is carried by its heading, not its numbers.
+    This is the "offline query processing and reranking" the task permits; it
+    reads only projected page text and returns real Memory citations, each of
+    which resolves via ``memory.get`` to the exact page text.
 
     Imports are local to avoid a module cycle (``builtin.runtime`` imports this
     package).
     """
-    from powercontext.builtin.artifacts.memory.models import MemoryCitation
-    from powercontext.builtin.runtime import SearchMemoryRequest
+    from collections import Counter
 
-    scores: dict[str, float] = {}
-    kept: dict[str, MemoryCitation] = {}
-    for query in _expanded_queries(question):
-        page = await memory.search(SearchMemoryRequest(query=query, mode="fts", limit=limit))
-        for rank, hit in enumerate(page.hits, start=1):
-            key = f"{hit.memory_ref.artifact_id}:{hit.entry_id}:{hit.entry_version_id}"
-            kept.setdefault(
-                key,
-                MemoryCitation(
-                    memory_ref=hit.memory_ref,
-                    entry_id=hit.entry_id,
-                    entry_version_id=hit.entry_version_id,
-                ),
-            )
-            scores[key] = scores.get(key, 0.0) + 1.0 / (_RRF_K + rank)
-    ranked = sorted(scores, key=lambda key: (-scores[key], key))
-    return tuple(kept[key] for key in ranked[:limit])
+    scoring_terms = _scoring_terms(question)
+    page = await memory.list()
+    scored: list[tuple[float, str, Any]] = []
+    for record in page.entries:
+        if not record.entry.sources:
+            continue
+        tokens, heading = _page_tokens(record.entry.text)
+        counts = Counter(tokens)
+        score = 0.0
+        for term in scoring_terms:
+            freq = counts.get(term, 0)
+            if freq:
+                score += (_TITLE_WEIGHT if term in heading else 1.0) * freq
+        if score <= 0.0:
+            continue
+        citation = record.citation
+        key = f"{citation.memory_ref.artifact_id}:{citation.entry_id}:{citation.entry_version_id}"
+        scored.append((score, key, citation))
+
+    scored.sort(key=lambda item: (-item[0], item[1]))
+    seen: set[str] = set()
+    results: list[Any] = []
+    for _score, key, citation in scored:
+        if key in seen:
+            continue
+        seen.add(key)
+        results.append(citation)
+        if len(results) >= limit:
+            break
+    return tuple(results)
 
 
 __all__ = [

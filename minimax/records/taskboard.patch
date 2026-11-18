@@ -1,0 +1,14 @@
+--- a/demo_app/src/taskboard.py
++++ b/demo_app/src/taskboard.py
+@@ -69,3 +69,11 @@
+         )
+         self._tasks[task_id] = updated
+         return updated
++
++    def filter_by_tag(self, tag: str) -> tuple[Task, ...]:
++        normalized = tag.strip().lower()
++        if not normalized:
++            return ()
++        return tuple(
++            task for task in self._tasks.values() if normalized in task.tags
++        )

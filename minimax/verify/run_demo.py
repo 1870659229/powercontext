@@ -11,6 +11,8 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
+import io
 import json
 import subprocess
 import sys
@@ -46,6 +48,23 @@ def run_pytest(node_ids: list[str]) -> tuple[int, str]:
     args = [sys.executable, "-m", "pytest", "-q", *[f"tests/test_taskboard.py::{n}" for n in node_ids]]
     result = subprocess.run(args, cwd=DEMO, capture_output=True, text=True, encoding="utf-8")
     return result.returncode, (result.stdout or "") + (result.stderr or "")
+
+
+def _capture(command, task: str) -> str:
+    """在当前进程内执行一个 CLI 动作并捕获其标准输出。
+
+    pylibseekdb 的 ``open()`` 是进程级单例：同一数据目录在一个进程里只能打开
+    一次，子进程方式在 Windows 上会因上一个实例尚未释放而打不开同一目录。
+    因此这里在同进程内调用，直接取函数的返回值。
+    """
+    import argparse
+
+    buffer = io.StringIO()
+    with contextlib.redirect_stdout(buffer):
+        code = command(argparse.Namespace(task=task))
+    if code != 0:
+        raise RuntimeError(f"命令执行失败（exit={code}）：{buffer.getvalue()}")
+    return buffer.getvalue()
 
 
 def summary_line(output: str) -> str:
@@ -108,28 +127,22 @@ def main() -> int:
     code, output = run_pytest(REGRESSION_TESTS)
     ok &= check(code == 0, "修改前回归测试通过", summary_line(output))
 
-    # 3. 上下文模块能输出四类内容
-    ctx_proc = subprocess.run(
-        [sys.executable, "-m", "context_module.cli", "context", "实现 TaskBoard 的 filter_by_tag 按标签筛选任务"],
-        cwd=ROOT,
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-    )
-    context = json.loads(ctx_proc.stdout)
+    # 3. 初始化索引与任务状态（同一进程内，随后复用同一 seekdb 实例）
+    from context_module.cli import cmd_context, cmd_init, cmd_status  # noqa: PLC0415
+
+    init_out = _capture(cmd_init, "")
+    ok &= check('"indexed_chunks"' in init_out, "索引初始化", init_out.strip()[:60])
+
+    # 4. 上下文模块能输出四类内容
+    #    同进程内调用：pylibseekdb 的 open() 是进程级单例，子进程方式在
+    #    Windows 上会因为上一个实例尚未退出而无法再次打开同一数据目录。
+    context = json.loads(_capture(cmd_context, "实现 TaskBoard 的 filter_by_tag 按标签筛选任务"))
     ok &= check([s["id"] for s in context["specs"]][:1] == ["S4"], "上下文首条规格为 S4")
     ok &= check(any(t["name"].startswith("test_filter_by_tag") for t in context["tests"]), "上下文包含目标测试")
     ok &= check(bool(context["progress"]["todo"]), "上下文包含待办事项")
 
-    # 4. 状态跨进程复用
-    status_proc = subprocess.run(
-        [sys.executable, "-m", "context_module.cli", "status"],
-        cwd=ROOT,
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-    )
-    state = json.loads(status_proc.stdout)
+    # 5. 任务状态可读（PowerContext 持久化在独立的 SQLite 中，与 seekdb 实例无关）
+    state = json.loads(_capture(cmd_status, ""))
     ok &= check("filter_by_tag" in json.dumps(state, ensure_ascii=False), "状态重启后可读")
 
     if args.apply:

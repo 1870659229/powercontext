@@ -127,17 +127,33 @@ def collect_chunks(project_root: Path) -> list[DocChunk]:
 
 
 class SeekDBIndex:
-    """嵌入式 seekdb 资料索引。"""
+    """嵌入式 seekdb 资料索引。
+
+    pylibseekdb 的 ``open()`` 在一个进程内只能生效一次（官方说明：它是进程级
+    单例，第二次调用会被静默忽略），因此这里按进程缓存实例：同一进程内多次
+    使用索引只真正打开一次，后续操作复用同一个实例与连接。
+    """
+
+    _instance: pylibseekdb.SeekdbInstance | None = None
+    _db_dir: str | None = None
 
     def __init__(self, data_dir: Path) -> None:
         self._data_dir = data_dir
-        self._instance: pylibseekdb.SeekdbInstance | None = None
         self._connection: pylibseekdb.Connection | None = None
 
     def open(self) -> SeekDBIndex:
         self._data_dir.mkdir(parents=True, exist_ok=True)
-        self._instance = pylibseekdb.open(str(self._data_dir))
-        self._connection = self._instance.connect()
+        target = str(self._data_dir)
+        if SeekDBIndex._instance is None:
+            SeekDBIndex._instance = pylibseekdb.open(target)
+            SeekDBIndex._db_dir = target
+        elif SeekDBIndex._db_dir != target:
+            raise RuntimeError(
+                "本进程已打开另一个 seekdb 数据目录"
+                f"（{SeekDBIndex._db_dir}）；pylibseekdb 的 open() 是进程级单例，"
+                "请在同一进程内复用同一个数据目录，或分进程执行。"
+            )
+        self._connection = SeekDBIndex._instance.connect()
         cursor = self._connection.cursor()
         cursor.execute(
             "CREATE TABLE IF NOT EXISTS documents ("
@@ -153,12 +169,14 @@ class SeekDBIndex:
         return self
 
     def close(self) -> None:
+        """释放本次使用的连接。
+
+        按官方说明，连接要在实例之前关闭；实例本身是进程级单例，不在这里关闭，
+        交给进程退出时回收，避免同一进程后续操作打不开数据目录。
+        """
         if self._connection is not None:
             self._connection.close()
             self._connection = None
-        if self._instance is not None:
-            self._instance.close()
-            self._instance = None
 
     def __enter__(self) -> SeekDBIndex:
         return self.open()

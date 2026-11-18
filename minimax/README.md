@@ -77,20 +77,27 @@ $env:MINIMAX_MODEL = "MiniMax-M2.7"           # 可选
 
 ## 四、调用入口
 
+> **重要：`pylibseekdb.open()` 是进程级单例**（官方说明：同一进程内第二次调用会被静默忽略），
+> 因此需要访问同一个 seekdb 数据目录的连续动作请写在**同一条命令**里。
+> `verify/run_demo.py` 就是这样做的：它在一个进程内完成建索引 → 检索 → 状态读回。
+
 ```bash
-# 1. 初始化：建 seekdb 索引 + 写入 PowerContext 初始任务状态
+# 1. 初始化 + 检索 + 读状态（一次进程内顺序执行，推荐用法）
+python -m context_module.cli init context "实现 TaskBoard 的 filter_by_tag 按标签筛选任务" status
+
+# 2. 只建索引 + 写入 PowerContext 初始任务状态
 python -m context_module.cli init
 
-# 2. 输出结构化开发上下文（JSON：规格 / 代码 / 测试 / 进展）
+# 3. 输出结构化开发上下文（JSON：规格 / 代码 / 测试 / 进展）
 python -m context_module.cli context "实现 TaskBoard 的 filter_by_tag 按标签筛选任务"
 
-# 3. 输出给模型的可读上下文
+# 4. 输出给模型的可读上下文
 python -m context_module.cli prompt "实现 TaskBoard 的 filter_by_tag 按标签筛选任务"
 
-# 4. 调用 MiniMax 生成补丁（需 MINIMAX_API_KEY），结果写入 records/
+# 5. 调用 MiniMax 生成补丁（需 MINIMAX_API_KEY），结果写入 records/
 python -m context_module.cli propose "实现 TaskBoard 的 filter_by_tag 按标签筛选任务"
 
-# 5. 读回 PowerContext 中的任务状态（验证重启复用）
+# 6. 读回 PowerContext 中的任务状态（验证重启复用）
 python -m context_module.cli status
 ```
 
@@ -106,10 +113,22 @@ python -m context_module.cli status
 }
 ```
 
+### 平台差异说明
+
+`pylibseekdb` 目前通过启动本地 seekdb runtime 进程提供嵌入式访问（官方说明：真正的进程内嵌模式尚未发布）。
+在 **Linux** 上实例关闭后可再次打开同一数据目录；在 **Windows** 上存在官方已知缺陷
+（seekdb-bindings issue #61：`close()` 早于 `seekdb.exe` 退出，数据目录仍被占用），
+导致同一目录在**另一个进程**里可能无法再次打开。
+
+本作品不依赖跨进程复用同一个 seekdb 数据目录：
+`verify/run_demo.py` 在单个进程内完成全部需要访问索引的步骤，
+任务状态则由 PowerContext 持久化在独立的 SQLite 中，与 seekdb 实例无关。
+
 ## 五、验证样例
 
 ```bash
-# 完整流程：自动还原到「修改前」→ 验证修改前失败 → 应用 MiniMax 补丁 → 验证修改后通过
+# 完整流程：还原到「修改前」→ 验证修改前失败 → 建索引 → 检索 → 状态读回
+#          → 应用 MiniMax 补丁 → 验证修改后通过
 python verify/run_demo.py --apply
 
 # 只验证「修改前」状态与上下文输出（不应用补丁）
@@ -122,6 +141,7 @@ python verify/run_demo.py --reset
 > `--apply` 会先把 `demo_app/src/taskboard.py` 还原为「修改前」版本
 > （依据 `records/snapshots/taskboard_before.py`），再应用补丁并复验，
 > 因此无论评审拿到的是哪个版本的代码，都能复现完整流程。
+> 该脚本在一个进程内完成全部步骤（`pylibseekdb.open()` 是进程级单例）。
 
 预期结果：
 

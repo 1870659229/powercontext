@@ -98,7 +98,16 @@ def cmd_status(_: argparse.Namespace) -> int:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="context_module", description="SDD 上下文管理模块")
+    parser = argparse.ArgumentParser(
+        prog="context_module",
+        description="SDD 上下文管理模块",
+        epilog=(
+            "可在一个进程内顺序执行多个动作，例如："
+            "python -m context_module.cli init context status。"
+            "pylibseekdb 的 open() 是进程级单例，同一数据目录在一个进程内只能打开一次，"
+            "因此连续操作请写在同一条命令里。"
+        ),
+    )
     sub = parser.add_subparsers(dest="command", required=True)
 
     sub.add_parser("init", help="建索引并初始化状态").set_defaults(func=cmd_init)
@@ -115,7 +124,38 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _run_actions(actions: list[str], task: str | None) -> int:
+    """在同一个进程内依次执行多个动作。
+
+    pylibseekdb 的 ``open()`` 是进程级单例：同一数据目录在一个进程里只能打开
+    一次，之后的 open 会被静默忽略。因此 init / context / status 这类需要访问
+    同一个索引的动作，必须放在同一个进程内顺序执行。
+    """
+    handlers = {
+        "init": lambda: cmd_init(argparse.Namespace()),
+        "status": lambda: cmd_status(argparse.Namespace()),
+        "context": lambda: cmd_context(argparse.Namespace(task=task or "")),
+        "prompt": lambda: cmd_prompt(argparse.Namespace(task=task or "")),
+        "propose": lambda: cmd_propose(argparse.Namespace(task=task or "")),
+    }
+    for action in actions:
+        if action not in handlers:
+            print(f"未知动作：{action}", file=sys.stderr)
+            return 2
+        code = handlers[action]()
+        if code != 0:
+            return code
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
+    argv = list(sys.argv[1:] if argv is None else argv)
+    known = {"init", "status", "context", "prompt", "propose"}
+    actions = [item for item in argv if item in known]
+    if len(actions) > 1:
+        # 多动作写法：第一个动作作为子命令，其余动作按顺序执行；任务描述取首个位置参数。
+        task = next((item for item in argv if item not in known and not item.startswith("-")), None)
+        return _run_actions(actions, task)
     parser = build_parser()
     args = parser.parse_args(argv)
     return args.func(args)

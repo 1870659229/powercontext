@@ -17,12 +17,12 @@ AI 开发助手修改代码时，需要知道：当前该遵守哪些规格、�
 
 | 组件 | 职责 |
 |---|---|
-| `indexer.py` | 把规格按编号(S1..S5)、代码按符号(def/class)、测试按函数切成可定位片段，写入嵌入式 seekdb 的 `documents` 表（含词元列） |
+| `indexer.py` | 把规格按编号(S1..S5)、代码按符号(def/class)、测试按函数切成可定位片段，写入嵌入式 seekdb 的 `documents` 表（含词元列）；按进程复用同一个 seekdb 实例（`open()` 是进程级单例） |
 | `context.py` | 按任务描述检索三类资料，加上 PowerContext 里的进展，产出 `DevContext`（可 JSON 化，也可渲染成 prompt） |
 | `state.py` | 用 PowerContext 的 CAPTURED Source 保存任务状态，`scope_id` 落一个小文件，重启后按 scope 读回 |
 | `minimax_client.py` | 标准库 HTTP 调用 MiniMax，强制模型输出 JSON（reasoning/patch/target_symbol），并把交互写入 `records/` |
-| `patcher.py` | 把补丁方法安全追加到目标类，先备份、拒绝重复方法 |
-| `verify/run_demo.py` | 端到端复现"修改前失败 → 应用补丁 → 修改后通过" |
+| `patcher.py` | 把补丁方法安全追加到目标类，先备份、拒绝重复方法，并把模型返回的缩进归一到类成员级 |
+| `verify/run_demo.py` | 端到端复现"修改前失败 → 建索引 → 检索 → 状态读回 → 应用补丁 → 修改后通过"，全程单进程 |
 
 ## 上下文选择方式
 
